@@ -1,0 +1,734 @@
+import { useState, useEffect, useRef, useCallback } from "react";
+
+const TOTAL_FILAS   = 50;
+const TOTAL_NIVELES = 6;
+const FILAS   = Array.from({ length: TOTAL_FILAS   }, (_, i) => i + 1);
+const NIVELES = Array.from({ length: TOTAL_NIVELES }, (_, i) => i + 1);
+const UNIDADES = ["kg", "g"];
+
+const EMPTY_FORM = { codigo:"", nombre:"", nroAnalisis:"", cantidad:"", unidad:"kg", fechaVencimiento:"" };
+const HOY = new Date().toISOString().slice(0, 10);
+
+function diasParaVencer(fecha) {
+  if (!fecha) return null;
+  return Math.ceil((new Date(fecha) - new Date(HOY)) / 86400000);
+}
+function estadoVencimiento(fecha) {
+  const d = diasParaVencer(fecha);
+  if (d === null) return null;
+  if (d < 0)   return { color:"#dc2626", bg:"#fee2e2", border:"#fca5a5" };
+  if (d <= 30) return { color:"#d97706", bg:"#fef3c7", border:"#fcd34d" };
+  return               { color:"#16a34a", bg:"#dcfce7", border:"#86efac" };
+}
+
+function parseFechaVoz(texto) {
+  const meses = { enero:1,febrero:2,marzo:3,abril:4,mayo:5,junio:6,julio:7,agosto:8,septiembre:9,octubre:10,noviembre:11,diciembre:12 };
+  const t = texto.toLowerCase().trim();
+  const numMatch = t.match(/(\d{1,2})[\/\-\s](\d{1,2})[\/\-\s](\d{4})/);
+  if (numMatch) { const [,d,m,y]=numMatch; return `${y}-${m.padStart(2,"0")}-${d.padStart(2,"0")}`; }
+  const verbalMatch = t.match(/(\d{1,2})\s+(?:de\s+)?([a-záéíóú]+)\s+(?:de\s+)?(\d{4})/);
+  if (verbalMatch) { const [,d,mes,y]=verbalMatch; const m=meses[mes]; if(m) return `${y}-${String(m).padStart(2,"0")}-${d.padStart(2,"0")}`; }
+  return null;
+}
+function parseCantidadVoz(texto) {
+  const t = texto.toLowerCase();
+  const unidad = t.includes(" g")||t.includes("gramo") ? "g" : "kg";
+  const numMatch = t.match(/[\d]+([.,]\d+)?/);
+  return { cantidad: numMatch ? numMatch[0].replace(",",".") : t.replace(/[^0-9.,]/g,"").replace(",","."), unidad };
+}
+
+// Valida: código = 4 dígitos, nroAnalisis = 6 dígitos
+function validarCodigo(v)      { return /^\d{4}$/.test(v.trim()); }
+function validarNroAnalisis(v) { return /^\d{6}$/.test(v.trim()); }
+
+const INITIAL_PALLETS = [
+  { fila:1,  nivel:1, codigo:"0012", nombre:"Lactosa monohidrato",      nroAnalisis:"202401", cantidad:"25",  unidad:"kg", fechaVencimiento:"2026-12-01" },
+  { fila:1,  nivel:2, codigo:"0034", nombre:"Celulosa microcristalina", nroAnalisis:"202402", cantidad:"500", unidad:"g",  fechaVencimiento:"2026-06-15" },
+  { fila:2,  nivel:1, codigo:"0056", nombre:"Almidón de maíz",          nroAnalisis:"202403", cantidad:"10",  unidad:"kg", fechaVencimiento:"2027-03-10" },
+  { fila:3,  nivel:2, codigo:"0078", nombre:"Estearato de magnesio",    nroAnalisis:"202404", cantidad:"200", unidad:"g",  fechaVencimiento:"2026-04-30" },
+  { fila:5,  nivel:3, codigo:"0090", nombre:"Dióxido de silicio",       nroAnalisis:"202405", cantidad:"5",   unidad:"kg", fechaVencimiento:"2026-05-10" },
+  { fila:8,  nivel:1, codigo:"0101", nombre:"Povidona K30",             nroAnalisis:"202406", cantidad:"1",   unidad:"kg", fechaVencimiento:"2027-08-20" },
+  { fila:12, nivel:4, codigo:"0115", nombre:"Talco farmacéutico",       nroAnalisis:"202407", cantidad:"750", unidad:"g",  fechaVencimiento:"2026-07-01" },
+];
+
+function QRDisplay({ value, size=160 }) {
+  const hash = value.split("").reduce((a,c)=>a+c.charCodeAt(0),0);
+  const cells=21, cell=size/cells;
+  const bits = Array.from({length:cells*cells},(_,i)=>{
+    const r=Math.floor(i/cells),c=i%cells;
+    return {r,c,on:((hash*(r*cells+c+1)*31337)%256)>128};
+  });
+  return (
+    <svg width={size} height={size}>
+      <rect width={size} height={size} fill="white"/>
+      {bits.map(({r,c,on})=>on&&<rect key={`${r}-${c}`} x={c*cell} y={r*cell} width={cell} height={cell} fill="#1e3a5f"/>)}
+      {[[0,0],[0,cells-7],[cells-7,0]].map(([row,col],i)=>(
+        <g key={i}>
+          <rect x={col*cell} y={row*cell} width={7*cell} height={7*cell} fill="#1e3a5f"/>
+          <rect x={(col+1)*cell} y={(row+1)*cell} width={5*cell} height={5*cell} fill="white"/>
+          <rect x={(col+2)*cell} y={(row+2)*cell} width={3*cell} height={3*cell} fill="#1e3a5f"/>
+        </g>
+      ))}
+    </svg>
+  );
+}
+
+function useVoice(onResult, lang="es-AR") {
+  const recogRef = useRef(null);
+  const [listening, setListening] = useState(false);
+  const [supported, setSupported] = useState(false);
+  useEffect(() => {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    setSupported(!!SR);
+    if (!SR) return;
+    const r = new SR();
+    r.lang = lang; r.continuous = false; r.interimResults = false;
+    r.onresult = e => { onResult(e.results[0][0].transcript); setListening(false); };
+    r.onerror  = () => setListening(false);
+    r.onend    = () => setListening(false);
+    recogRef.current = r;
+  }, []);
+  const start = useCallback(() => { if(!recogRef.current) return; setListening(true); recogRef.current.start(); }, []);
+  const stop  = useCallback(() => { if(!recogRef.current) return; recogRef.current.stop(); setListening(false); }, []);
+  return { listening, supported, start, stop };
+}
+
+function MicBtn({ onResult, field, activeField, setActiveField }) {
+  const isActive = activeField === field;
+  const { listening, supported, start, stop } = useVoice(text => { onResult(field, text); setActiveField(null); });
+  if (!supported) return null;
+  function toggle() { if (listening) { stop(); setActiveField(null); } else { start(); setActiveField(field); } }
+  return (
+    <button type="button" onClick={toggle} title={listening?"Detener":"Dictar por voz"}
+      style={{ ...s.micBtn, background: listening?"#dc2626":"#1e40af", border: `1px solid ${listening?"#dc2626":"#3b82f6"}`, animation: listening?"pulse 1s infinite":"none" }}>
+      {listening ? "⏹" : "🎙"}
+    </button>
+  );
+}
+
+export default function App() {
+  const [pallets, setPallets]         = useState(INITIAL_PALLETS);
+  const [view, setView]               = useState("mapa");
+  const [mapPage, setMapPage]         = useState(0);
+  const [modalPos, setModalPos]       = useState(null);
+  const [editForm, setEditForm]       = useState(null);
+  const [search, setSearch]           = useState("");
+  const [qrData, setQrData]           = useState(null);
+  const [toast, setToast]             = useState(null);
+  const [activeField, setActiveField] = useState(null);
+  const [voiceLog, setVoiceLog]       = useState("");
+  const [formErrors, setFormErrors]   = useState({});
+
+  const FILAS_PER_PAGE = 10;
+  const totalPages     = Math.ceil(TOTAL_FILAS / FILAS_PER_PAGE);
+  const filasVisible   = FILAS.slice(mapPage * FILAS_PER_PAGE, (mapPage + 1) * FILAS_PER_PAGE);
+  const totalSlots     = TOTAL_FILAS * TOTAL_NIVELES;
+  const ocupadas       = pallets.length;
+  const libres         = totalSlots - ocupadas;
+  const pctOcup        = Math.round(ocupadas / totalSlots * 100);
+  const pctLibre       = 100 - pctOcup;
+
+  function showToast(msg, type="ok") { setToast({msg,type}); setTimeout(()=>setToast(null),2800); }
+  function getPallet(fila, nivel)    { return pallets.find(p=>p.fila===fila&&p.nivel===nivel)||null; }
+
+  function openModal(fila, nivel) {
+    const p = getPallet(fila, nivel);
+    setModalPos({fila,nivel});
+    setEditForm(p ? {...p} : {...EMPTY_FORM, fila, nivel});
+    setVoiceLog(""); setActiveField(null); setFormErrors({});
+  }
+
+  function saveModal() {
+    const {fila,nivel} = modalPos;
+    const hasData = editForm.codigo||editForm.nombre||editForm.nroAnalisis||editForm.cantidad;
+    const errors = {};
+    if (hasData) {
+      if (!editForm.codigo)                  errors.codigo      = "Requerido";
+      else if (!validarCodigo(editForm.codigo)) errors.codigo   = "Debe ser 4 dígitos";
+      if (editForm.nroAnalisis && !validarNroAnalisis(editForm.nroAnalisis)) errors.nroAnalisis = "Debe ser 6 dígitos";
+    }
+    if (Object.keys(errors).length) { setFormErrors(errors); showToast("Revisá los campos marcados","err"); return; }
+    setPallets(prev => {
+      const rest = prev.filter(p=>!(p.fila===fila&&p.nivel===nivel));
+      return hasData ? [...rest, {...editForm,fila,nivel}] : rest;
+    });
+    setModalPos(null);
+    showToast(hasData ? "Posición guardada ✓" : "Posición liberada");
+  }
+
+  function deleteFromModal() {
+    const {fila,nivel}=modalPos;
+    setPallets(prev=>prev.filter(p=>!(p.fila===fila&&p.nivel===nivel)));
+    setModalPos(null); showToast("Posición liberada");
+  }
+
+  function handleVoiceResult(field, text) {
+    setVoiceLog(`🎙 "${text}"`);
+    if (field==="fechaVencimiento") {
+      const fecha = parseFechaVoz(text);
+      if (fecha) { setEditForm(f=>({...f,fechaVencimiento:fecha})); return; }
+      showToast("No pude interpretar la fecha. Intentá: '15 de junio de 2027'","err"); return;
+    }
+    if (field==="cantidad") {
+      const {cantidad,unidad} = parseCantidadVoz(text);
+      setEditForm(f=>({...f,cantidad,unidad})); return;
+    }
+    // codigo y nroAnalisis: extraer solo dígitos
+    if (field==="codigo")      { const d=text.replace(/\D/g,"").slice(0,4).padStart(4,"0"); setEditForm(f=>({...f,codigo:d})); return; }
+    if (field==="nroAnalisis") { const d=text.replace(/\D/g,"").slice(0,6).padStart(6,"0"); setEditForm(f=>({...f,nroAnalisis:d})); return; }
+    setEditForm(f=>({...f,[field]:text.trim()}));
+  }
+
+  const filteredPallets = pallets.filter(p =>
+    !search ||
+    p.codigo?.includes(search) ||
+    p.nombre?.toLowerCase().includes(search.toLowerCase()) ||
+    p.nroAnalisis?.includes(search) ||
+    `${p.fila}.${p.nivel}`.includes(search)
+  );
+
+  const vencProximos = [...pallets].filter(p=>p.fechaVencimiento).sort((a,b)=>a.fechaVencimiento.localeCompare(b.fechaVencimiento)).slice(0,8);
+
+  return (
+    <div style={s.root}>
+      <style>{`
+        @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+        * { box-sizing: border-box; }
+        input[type=date]::-webkit-calendar-picker-indicator { filter: invert(0.3) sepia(1) saturate(3) hue-rotate(190deg); }
+        ::-webkit-scrollbar { width:6px; height:6px; }
+        ::-webkit-scrollbar-track { background:#e0f2fe; }
+        ::-webkit-scrollbar-thumb { background:#93c5fd; border-radius:3px; }
+      `}</style>
+
+      {/* HEADER */}
+      <header style={s.header}>
+        <div style={s.headerInner}>
+          <div style={s.logoWrap}>
+            <div style={s.logoCircle}>⚗</div>
+            <div>
+              <div style={s.logoText}>TRB PHARMA</div>
+              <div style={s.logoSub}>Sistema de Almacenamiento · Central de Pesadas</div>
+            </div>
+          </div>
+          <nav style={s.nav}>
+            {[["mapa","🗺 Mapa"],["lista","☰ Lista"],["analisis","📊 Análisis"]].map(([v,label])=>(
+              <button key={v} onClick={()=>setView(v)} style={{...s.navBtn,...(view===v?s.navBtnActive:{})}}>
+                {label}
+              </button>
+            ))}
+          </nav>
+        </div>
+      </header>
+
+      {toast && (
+        <div style={{...s.toast, background:toast.type==="err"?"#dc2626":"#16a34a"}}>
+          {toast.msg}
+        </div>
+      )}
+
+      <main style={s.main}>
+
+        {/* ===== MAPA ===== */}
+        {view==="mapa" && (
+          <div>
+            {/* KPIs */}
+            <div style={s.kpiRow}>
+              {[
+                { num:ocupadas,  label:"Posiciones ocupadas",  pct:pctOcup,  color:"#1d4ed8", light:"#dbeafe", icon:"📦" },
+                { num:libres,    label:"Posiciones disponibles",pct:pctLibre, color:"#16a34a", light:"#dcfce7", icon:"✅" },
+                { num:pallets.filter(p=>{const d=diasParaVencer(p.fechaVencimiento);return d!==null&&d>=0&&d<=30;}).length,
+                  label:"Vencen en ≤30 días", pct:null, color:"#d97706", light:"#fef3c7", icon:"⚠️" },
+                { num:pallets.filter(p=>{const d=diasParaVencer(p.fechaVencimiento);return d!==null&&d<0;}).length,
+                  label:"Materias vencidas", pct:null, color:"#dc2626", light:"#fee2e2", icon:"🚫" },
+              ].map(({num,label,pct,color,light,icon})=>(
+                <div key={label} style={{...s.kpiCard, borderTop:`4px solid ${color}`}}>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start"}}>
+                    <div>
+                      <div style={{...s.kpiNum, color}}>{num}</div>
+                      <div style={s.kpiLabel}>{label}</div>
+                    </div>
+                    <div style={{...s.kpiIcon, background:light}}>{icon}</div>
+                  </div>
+                  {pct!=null && (
+                    <div style={{marginTop:10}}>
+                      <div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}>
+                        <span style={{fontSize:10,color:"#64748b"}}>Ocupación</span>
+                        <span style={{fontSize:10,fontWeight:700,color}}>{pct}%</span>
+                      </div>
+                      <div style={s.kpiBar}><div style={{...s.kpiBarFill,width:`${pct}%`,background:color}}/></div>
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+
+            {/* Paginador filas */}
+            <div style={s.sectionCard}>
+              <div style={s.sectionCardHeader}>
+                <div style={s.sectionTitle}>🗺 Mapa de posiciones</div>
+                <div style={{display:"flex",gap:4,flexWrap:"wrap",alignItems:"center"}}>
+                  <span style={s.pageLabel}>Filas {mapPage*FILAS_PER_PAGE+1}–{Math.min((mapPage+1)*FILAS_PER_PAGE,TOTAL_FILAS)}</span>
+                  <button onClick={()=>setMapPage(p=>Math.max(0,p-1))} disabled={mapPage===0} style={s.pageBtn}>‹</button>
+                  {Array.from({length:totalPages},(_,i)=>(
+                    <button key={i} onClick={()=>setMapPage(i)} style={{...s.pageBtn,...(mapPage===i?s.pageBtnActive:{})}}>
+                      F{i*FILAS_PER_PAGE+1}–{Math.min((i+1)*FILAS_PER_PAGE,TOTAL_FILAS)}
+                    </button>
+                  ))}
+                  <button onClick={()=>setMapPage(p=>Math.min(totalPages-1,p+1))} disabled={mapPage===totalPages-1} style={s.pageBtn}>›</button>
+                </div>
+              </div>
+
+              {/* Grilla: filas verticales, niveles horizontales */}
+              <div style={{overflowX:"auto"}}>
+                {/* Header niveles */}
+                <div style={s.gridHeader}>
+                  <div style={s.filaLabel}/>
+                  {NIVELES.map(n=>(
+                    <div key={n} style={s.nivelHeader}>
+                      <div style={s.nivelHeaderBadge}>N{n}</div>
+                    </div>
+                  ))}
+                </div>
+                {/* Filas */}
+                {filasVisible.map(fila=>(
+                  <div key={fila} style={{...s.gridFila, background: fila%2===0?"#f0f9ff":"#ffffff"}}>
+                    <div style={s.filaLabel}>
+                      <span style={s.filaNum}>F{fila}</span>
+                    </div>
+                    {NIVELES.map(nivel=>{
+                      const p = getPallet(fila,nivel);
+                      const d = p ? diasParaVencer(p.fechaVencimiento) : null;
+                      let slotBg="#e0f2fe", slotBorder="#bae6fd", slotColor="#0369a1";
+                      if (p) {
+                        if (d!==null&&d<0)   { slotBg="#fee2e2"; slotBorder="#fca5a5"; slotColor="#dc2626"; }
+                        else if (d!==null&&d<=30) { slotBg="#fef3c7"; slotBorder="#fcd34d"; slotColor="#b45309"; }
+                        else                 { slotBg="#dbeafe"; slotBorder="#93c5fd"; slotColor="#1d4ed8"; }
+                      }
+                      return (
+                        <button key={nivel} onClick={()=>openModal(fila,nivel)}
+                          title={p?`${p.codigo} · ${p.nombre}`:`F${fila}.N${nivel} · Libre`}
+                          style={{...s.slot, background:slotBg, border:`1.5px solid ${slotBorder}`, color:slotColor}}>
+                          {p
+                            ? <><div style={s.slotCode}>{p.codigo}</div><div style={s.slotName}>{p.nombre?.slice(0,12)}</div></>
+                            : <div style={s.slotFree}>+</div>
+                          }
+                        </button>
+                      );
+                    })}
+                  </div>
+                ))}
+              </div>
+
+              {/* Leyenda */}
+              <div style={s.leyenda}>
+                {[
+                  ["#e0f2fe","#bae6fd","#0369a1","Disponible"],
+                  ["#dbeafe","#93c5fd","#1d4ed8","Ocupada"],
+                  ["#fef3c7","#fcd34d","#b45309","Vence ≤30d"],
+                  ["#fee2e2","#fca5a5","#dc2626","Vencida"],
+                ].map(([bg,bd,color,label])=>(
+                  <div key={label} style={s.leyendaItem}>
+                    <div style={{width:14,height:14,borderRadius:4,background:bg,border:`1.5px solid ${bd}`}}/>
+                    <span style={{color:"#475569"}}>{label}</span>
+                  </div>
+                ))}
+                <span style={{marginLeft:"auto",fontSize:10,color:"#94a3b8"}}>Tocá una posición para editar</span>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ===== LISTA ===== */}
+        {view==="lista" && (
+          <div style={s.sectionCard}>
+            <div style={s.sectionCardHeader}>
+              <div style={s.sectionTitle}>☰ Materias primas almacenadas</div>
+              <span style={{fontSize:12,color:"#64748b"}}>{filteredPallets.length} registros · {libres} posiciones libres</span>
+            </div>
+            <input placeholder="🔍 Buscar por código, nombre, N° análisis o posición..."
+              value={search} onChange={e=>setSearch(e.target.value)} style={s.searchInput}/>
+            <div style={s.lista}>
+              {filteredPallets.map(p=>{
+                const venc=estadoVencimiento(p.fechaVencimiento);
+                const dias=diasParaVencer(p.fechaVencimiento);
+                return (
+                  <div key={`${p.fila}-${p.nivel}`} style={s.listaItem} onClick={()=>openModal(p.fila,p.nivel)}>
+                    <div style={s.listaPosBox}>
+                      <div style={s.listaPosF}>F{p.fila}</div>
+                      <div style={s.listaPosN}>N{p.nivel}</div>
+                    </div>
+                    <div style={s.listaInfo}>
+                      <div style={s.listaNombre}>{p.nombre||"—"}</div>
+                      <div style={s.listaMeta}>
+                        🏷 {p.codigo} &nbsp;·&nbsp; 🔬 {p.nroAnalisis||"—"} &nbsp;·&nbsp; ⚖ {p.cantidad} {p.unidad}
+                      </div>
+                    </div>
+                    {venc && (
+                      <div style={{fontSize:11,fontWeight:700,padding:"4px 10px",borderRadius:20,
+                        color:venc.color,background:venc.bg,border:`1px solid ${venc.border}`,flexShrink:0}}>
+                        {dias<0?"VENC.":dias===0?"HOY":`${dias}d`}
+                      </div>
+                    )}
+                    <span style={{color:"#94a3b8",fontSize:18}}>›</span>
+                  </div>
+                );
+              })}
+              {!filteredPallets.length && <div style={s.emptyMsg}>No se encontraron materias primas</div>}
+            </div>
+          </div>
+        )}
+
+        {/* ===== ANÁLISIS ===== */}
+        {view==="analisis" && (
+          <div>
+            <div style={s.analGrid}>
+              {/* Ocupación */}
+              <div style={s.analCard}>
+                <div style={s.analTitle}>Ocupación del depósito</div>
+                <div style={{display:"flex",alignItems:"center",gap:20,marginBottom:16}}>
+                  <div style={{position:"relative",width:90,height:90,flexShrink:0}}>
+                    <svg viewBox="0 0 36 36" style={{width:90,height:90,transform:"rotate(-90deg)"}}>
+                      <circle cx="18" cy="18" r="15.9" fill="none" stroke="#e0f2fe" strokeWidth="3.5"/>
+                      <circle cx="18" cy="18" r="15.9" fill="none" stroke="#1d4ed8" strokeWidth="3.5"
+                        strokeDasharray={`${pctOcup} ${100-pctOcup}`} strokeLinecap="round"/>
+                    </svg>
+                    <div style={{position:"absolute",top:"50%",left:"50%",transform:"translate(-50%,-50%)",textAlign:"center"}}>
+                      <div style={{fontSize:16,fontWeight:800,color:"#1d4ed8"}}>{pctOcup}%</div>
+                    </div>
+                  </div>
+                  <div style={{flex:1}}>
+                    <div style={s.analStatRow}><span style={{color:"#1d4ed8",fontWeight:700,fontSize:18}}>{ocupadas}</span><span style={{color:"#64748b",fontSize:13,marginLeft:6}}>ocupadas</span></div>
+                    <div style={s.analStatRow}><span style={{color:"#16a34a",fontWeight:700,fontSize:18}}>{libres}</span><span style={{color:"#64748b",fontSize:13,marginLeft:6}}>disponibles</span></div>
+                    <div style={{color:"#94a3b8",fontSize:11,marginTop:4}}>Total: {totalSlots} posiciones</div>
+                  </div>
+                </div>
+                <div style={{...s.analBar,background:"#e0f2fe"}}><div style={{...s.analBarFill,width:`${pctOcup}%`,background:"#1d4ed8"}}/></div>
+                <div style={{...s.analBar,marginTop:4,background:"#dcfce7"}}><div style={{...s.analBarFill,width:`${pctLibre}%`,background:"#16a34a"}}/></div>
+              </div>
+
+              {/* Vencimientos */}
+              <div style={s.analCard}>
+                <div style={s.analTitle}>Estado de vencimientos</div>
+                {[
+                  {label:"Vencidas",       count:pallets.filter(p=>{const d=diasParaVencer(p.fechaVencimiento);return d!==null&&d<0;}).length,       color:"#dc2626",bg:"#fee2e2"},
+                  {label:"Vencen ≤30 días",count:pallets.filter(p=>{const d=diasParaVencer(p.fechaVencimiento);return d!==null&&d>=0&&d<=30;}).length, color:"#d97706",bg:"#fef3c7"},
+                  {label:"Vencen >30 días",count:pallets.filter(p=>{const d=diasParaVencer(p.fechaVencimiento);return d!==null&&d>30;}).length,         color:"#16a34a",bg:"#dcfce7"},
+                  {label:"Sin fecha",      count:pallets.filter(p=>!p.fechaVencimiento).length,                                                        color:"#64748b",bg:"#f1f5f9"},
+                ].map(({label,count,color,bg})=>(
+                  <div key={label} style={{...s.analRow,marginBottom:12}}>
+                    <div style={{width:32,height:32,borderRadius:8,background:bg,display:"flex",alignItems:"center",justifyContent:"center",fontWeight:800,fontSize:14,color,flexShrink:0}}>{count}</div>
+                    <div style={{flex:1,marginLeft:10}}>
+                      <div style={{fontSize:12,color:"#374151",fontWeight:600}}>{label}</div>
+                      <div style={s.analBar}><div style={{...s.analBarFill,width:`${pallets.length?Math.round(count/pallets.length*100):0}%`,background:color}}/></div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              {/* Próximos vencimientos */}
+              <div style={{...s.analCard,gridColumn:"1/-1"}}>
+                <div style={s.analTitle}>Próximos vencimientos</div>
+                <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(240px,1fr))",gap:10}}>
+                  {vencProximos.map(p=>{
+                    const venc=estadoVencimiento(p.fechaVencimiento);
+                    const dias=diasParaVencer(p.fechaVencimiento);
+                    return (
+                      <div key={`${p.fila}-${p.nivel}`}
+                        style={{background:"#fff",border:`1.5px solid ${venc?.border||"#e2e8f0"}`,borderRadius:10,padding:14,cursor:"pointer",boxShadow:"0 1px 3px rgba(0,0,0,0.06)"}}
+                        onClick={()=>openModal(p.fila,p.nivel)}>
+                        <div style={{display:"flex",justifyContent:"space-between",marginBottom:6}}>
+                          <span style={{fontWeight:700,fontSize:14,color:"#1e3a5f"}}>{p.codigo}</span>
+                          <span style={{fontSize:11,fontWeight:700,padding:"2px 8px",borderRadius:20,color:venc?.color,background:venc?.bg}}>
+                            {dias<0?"VENCIDO":dias===0?"HOY":`${dias}d`}
+                          </span>
+                        </div>
+                        <div style={{fontSize:12,color:"#374151",marginBottom:4}}>{p.nombre}</div>
+                        <div style={{fontSize:11,color:"#94a3b8"}}>F{p.fila}.N{p.nivel} · {p.cantidad} {p.unidad} · {p.fechaVencimiento}</div>
+                      </div>
+                    );
+                  })}
+                  {!vencProximos.length && <div style={{color:"#94a3b8",fontSize:13}}>Sin vencimientos registrados</div>}
+                </div>
+              </div>
+
+              {/* Ocupación por fila */}
+              <div style={{...s.analCard,gridColumn:"1/-1"}}>
+                <div style={s.analTitle}>Ocupación por fila</div>
+                <div style={{display:"flex",gap:3,flexWrap:"wrap",alignItems:"flex-end"}}>
+                  {FILAS.map(fila=>{
+                    const count=pallets.filter(p=>p.fila===fila).length;
+                    const pct=Math.round(count/TOTAL_NIVELES*100);
+                    return (
+                      <div key={fila} style={{textAlign:"center",width:22}}>
+                        <div style={{height:36,background:"#e0f2fe",borderRadius:"3px 3px 0 0",position:"relative",overflow:"hidden"}}>
+                          <div style={{position:"absolute",bottom:0,left:0,right:0,height:`${pct}%`,
+                            background:pct===100?"#dc2626":pct>=50?"#d97706":"#1d4ed8",transition:"height 0.4s"}}/>
+                        </div>
+                        <div style={{fontSize:6,color:"#94a3b8",marginTop:2}}>F{fila}</div>
+                      </div>
+                    );
+                  })}
+                </div>
+                <div style={{display:"flex",gap:14,marginTop:10,flexWrap:"wrap"}}>
+                  {[["#1d4ed8","<50%"],["#d97706","≥50%"],["#dc2626","100%"]].map(([c,l])=>(
+                    <div key={l} style={{display:"flex",alignItems:"center",gap:5,fontSize:11,color:"#64748b"}}>
+                      <div style={{width:10,height:10,background:c,borderRadius:2}}/>
+                      {l} de niveles
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+      </main>
+
+      {/* ===== MODAL CON VOZ ===== */}
+      {modalPos && editForm && (
+        <div style={s.modalOverlay} onClick={e=>{if(e.target===e.currentTarget)setModalPos(null);}}>
+          <div style={s.modalBox}>
+            <div style={s.modalHeader}>
+              <div>
+                <div style={s.modalTitle}>Posición F{modalPos.fila} · N{modalPos.nivel}</div>
+                <div style={s.modalSub}>Fila {modalPos.fila} · Nivel {modalPos.nivel}</div>
+              </div>
+              <div style={{display:"flex",gap:8}}>
+                {getPallet(modalPos.fila,modalPos.nivel) && (
+                  <button onClick={()=>setQrData(editForm)} style={s.btnQrSm}>QR</button>
+                )}
+                <button onClick={()=>setModalPos(null)} style={s.btnClose}>✕</button>
+              </div>
+            </div>
+
+            {activeField && (
+              <div style={s.voiceBanner}>
+                <span style={s.voiceDot}/>
+                Escuchando para <strong style={{marginLeft:4}}>{
+                  {codigo:"Código",nombre:"Nombre",nroAnalisis:"N° Análisis",fechaVencimiento:"Fecha vencimiento",cantidad:"Cantidad"}[activeField]
+                }</strong>... hablá ahora
+              </div>
+            )}
+            {voiceLog && !activeField && (
+              <div style={s.voiceLog}>{voiceLog}</div>
+            )}
+
+            <div style={s.modalBody}>
+              {/* Código — 4 dígitos */}
+              <div style={s.formGroup}>
+                <label style={s.formLabel}>Código de materia prima <span style={{color:"#94a3b8"}}>(4 dígitos)</span></label>
+                <div style={s.inputRow}>
+                  <input maxLength={4} placeholder="Ej: 0012" value={editForm.codigo||""}
+                    onChange={e=>{ const v=e.target.value.replace(/\D/g,"").slice(0,4); setEditForm(f=>({...f,codigo:v})); setFormErrors(fe=>({...fe,codigo:undefined})); }}
+                    style={{...s.formInput,flex:1,borderColor:formErrors.codigo?"#dc2626":activeField==="codigo"?"#1d4ed8":"#cbd5e1",
+                      boxShadow:activeField==="codigo"?"0 0 0 3px rgba(29,78,216,0.15)":"none"}}/>
+                  <MicBtn field="codigo" onResult={handleVoiceResult} activeField={activeField} setActiveField={setActiveField}/>
+                </div>
+                {formErrors.codigo && <div style={s.fieldError}>{formErrors.codigo}</div>}
+              </div>
+
+              {/* Nombre */}
+              <div style={s.formGroup}>
+                <label style={s.formLabel}>Nombre de materia prima</label>
+                <div style={s.inputRow}>
+                  <input placeholder="Ej: Lactosa monohidrato" value={editForm.nombre||""}
+                    onChange={e=>setEditForm(f=>({...f,nombre:e.target.value}))}
+                    style={{...s.formInput,flex:1,borderColor:activeField==="nombre"?"#1d4ed8":"#cbd5e1",
+                      boxShadow:activeField==="nombre"?"0 0 0 3px rgba(29,78,216,0.15)":"none"}}/>
+                  <MicBtn field="nombre" onResult={handleVoiceResult} activeField={activeField} setActiveField={setActiveField}/>
+                </div>
+              </div>
+
+              {/* N° análisis — 6 dígitos */}
+              <div style={s.formGroup}>
+                <label style={s.formLabel}>N° de análisis <span style={{color:"#94a3b8"}}>(6 dígitos)</span></label>
+                <div style={s.inputRow}>
+                  <input maxLength={6} placeholder="Ej: 202401" value={editForm.nroAnalisis||""}
+                    onChange={e=>{ const v=e.target.value.replace(/\D/g,"").slice(0,6); setEditForm(f=>({...f,nroAnalisis:v})); setFormErrors(fe=>({...fe,nroAnalisis:undefined})); }}
+                    style={{...s.formInput,flex:1,borderColor:formErrors.nroAnalisis?"#dc2626":activeField==="nroAnalisis"?"#1d4ed8":"#cbd5e1",
+                      boxShadow:activeField==="nroAnalisis"?"0 0 0 3px rgba(29,78,216,0.15)":"none"}}/>
+                  <MicBtn field="nroAnalisis" onResult={handleVoiceResult} activeField={activeField} setActiveField={setActiveField}/>
+                </div>
+                {formErrors.nroAnalisis && <div style={s.fieldError}>{formErrors.nroAnalisis}</div>}
+              </div>
+
+              {/* Fecha vencimiento */}
+              <div style={s.formGroup}>
+                <label style={s.formLabel}>Fecha de vencimiento</label>
+                <div style={s.inputRow}>
+                  <input type="date" value={editForm.fechaVencimiento||""}
+                    onChange={e=>setEditForm(f=>({...f,fechaVencimiento:e.target.value}))}
+                    style={{...s.formInput,flex:1,borderColor:activeField==="fechaVencimiento"?"#1d4ed8":"#cbd5e1",
+                      boxShadow:activeField==="fechaVencimiento"?"0 0 0 3px rgba(29,78,216,0.15)":"none"}}/>
+                  <MicBtn field="fechaVencimiento" onResult={handleVoiceResult} activeField={activeField} setActiveField={setActiveField}/>
+                </div>
+              </div>
+
+              {/* Cantidad */}
+              <div style={s.formGroup}>
+                <label style={s.formLabel}>Cantidad <span style={{color:"#94a3b8"}}>(podés decir "25 kilogramos" o "500 gramos")</span></label>
+                <div style={s.inputRow}>
+                  <input type="number" min="0" placeholder="Ej: 25" value={editForm.cantidad||""}
+                    onChange={e=>setEditForm(f=>({...f,cantidad:e.target.value}))}
+                    style={{...s.formInput,flex:2,borderColor:activeField==="cantidad"?"#1d4ed8":"#cbd5e1",
+                      boxShadow:activeField==="cantidad"?"0 0 0 3px rgba(29,78,216,0.15)":"none"}}/>
+                  <select value={editForm.unidad||"kg"} onChange={e=>setEditForm(f=>({...f,unidad:e.target.value}))} style={{...s.formInput,flex:1}}>
+                    {UNIDADES.map(u=><option key={u} value={u}>{u}</option>)}
+                  </select>
+                  <MicBtn field="cantidad" onResult={handleVoiceResult} activeField={activeField} setActiveField={setActiveField}/>
+                </div>
+              </div>
+
+              {/* Alerta vencimiento */}
+              {editForm.fechaVencimiento && (()=>{
+                const venc=estadoVencimiento(editForm.fechaVencimiento);
+                const dias=diasParaVencer(editForm.fechaVencimiento);
+                return venc?(
+                  <div style={{borderRadius:8,padding:"9px 14px",fontSize:12,fontWeight:600,marginBottom:8,
+                    background:venc.bg,border:`1px solid ${venc.border}`,color:venc.color}}>
+                    {dias<0?`⚠ VENCIDA hace ${Math.abs(dias)} días`:dias===0?"⚠ Vence HOY":`✓ Vence en ${dias} días (${editForm.fechaVencimiento})`}
+                  </div>
+                ):null;
+              })()}
+
+              {/* Tips de voz */}
+              <div style={s.voiceTips}>
+                <div style={s.voiceTipsTitle}>💡 Guía de dictado por voz</div>
+                <div style={s.voiceTipRow}><span style={s.voiceTipField}>Código</span><span style={s.voiceTipEx}>Decí "cero cero doce" → 0012</span></div>
+                <div style={s.voiceTipRow}><span style={s.voiceTipField}>Nombre</span><span style={s.voiceTipEx}>"lactosa monohidrato"</span></div>
+                <div style={s.voiceTipRow}><span style={s.voiceTipField}>N° análisis</span><span style={s.voiceTipEx}>"dos cero dos cuatro cero uno" → 202401</span></div>
+                <div style={s.voiceTipRow}><span style={s.voiceTipField}>Fecha</span><span style={s.voiceTipEx}>"15 de junio de 2027"</span></div>
+                <div style={s.voiceTipRow}><span style={s.voiceTipField}>Cantidad</span><span style={s.voiceTipEx}>"25 kilogramos" / "500 gramos"</span></div>
+              </div>
+            </div>
+
+            <div style={s.modalFooter}>
+              {getPallet(modalPos.fila,modalPos.nivel) && (
+                <button onClick={deleteFromModal} style={s.btnDel}>Liberar posición</button>
+              )}
+              <div style={{display:"flex",gap:8,marginLeft:"auto"}}>
+                <button onClick={()=>setModalPos(null)} style={s.btnCancel}>Cancelar</button>
+                <button onClick={saveModal} style={s.btnSave}>Guardar</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ===== MODAL QR ===== */}
+      {qrData && (
+        <div style={s.modalOverlay} onClick={e=>{if(e.target===e.currentTarget)setQrData(null);}}>
+          <div style={{...s.modalBox,maxWidth:320,textAlign:"center"}}>
+            <div style={s.modalHeader}>
+              <div style={s.modalTitle}>QR · F{qrData.fila}.N{qrData.nivel}</div>
+              <button onClick={()=>setQrData(null)} style={s.btnClose}>✕</button>
+            </div>
+            <div style={{padding:"8px 20px 20px"}}>
+              <div style={{display:"inline-block",padding:14,background:"#fff",borderRadius:12,border:"1px solid #e0f2fe",boxShadow:"0 4px 12px rgba(0,0,0,0.08)"}}>
+                <QRDisplay value={`POS:F${qrData.fila}.N${qrData.nivel}|CMP:${qrData.codigo}|NOMBRE:${qrData.nombre}|NA:${qrData.nroAnalisis}|CANT:${qrData.cantidad}${qrData.unidad}|VENC:${qrData.fechaVencimiento}`} size={160}/>
+              </div>
+              <div style={{marginTop:14,fontSize:13,color:"#374151",lineHeight:1.9,textAlign:"left",background:"#f0f9ff",borderRadius:8,padding:"12px 14px"}}>
+                <div style={{fontWeight:700,color:"#1e3a5f",marginBottom:4}}>{qrData.nombre}</div>
+                <div>Código: <strong>{qrData.codigo}</strong></div>
+                <div>N° Análisis: <strong>{qrData.nroAnalisis||"—"}</strong></div>
+                <div>Cantidad: <strong>{qrData.cantidad} {qrData.unidad}</strong></div>
+                <div>Vencimiento: <strong>{qrData.fechaVencimiento||"—"}</strong></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* FOOTER */}
+      <footer style={s.footer}>
+        <span>TRB PHARMA · Sistema de Almacenamiento · Central de Pesadas</span>
+        <span>{TOTAL_FILAS} filas × {TOTAL_NIVELES} niveles · {totalSlots} posiciones · {new Date().toLocaleDateString("es-AR")}</span>
+      </footer>
+    </div>
+  );
+}
+
+// ── Estilos: diseño blanco y celeste ──
+const s = {
+  root:         { minHeight:"100vh", background:"linear-gradient(135deg,#f0f9ff 0%,#e0f2fe 50%,#bae6fd 100%)", color:"#1e293b", fontFamily:"'Segoe UI',system-ui,sans-serif" },
+  header:       { background:"linear-gradient(90deg,#1e3a5f 0%,#1d4ed8 100%)", boxShadow:"0 2px 12px rgba(29,78,216,0.3)", position:"sticky", top:0, zIndex:100 },
+  headerInner:  { maxWidth:1200, margin:"0 auto", padding:"14px 20px", display:"flex", alignItems:"center", justifyContent:"space-between", flexWrap:"wrap", gap:10 },
+  logoWrap:     { display:"flex", alignItems:"center", gap:12 },
+  logoCircle:   { width:42, height:42, borderRadius:"50%", background:"rgba(255,255,255,0.15)", display:"flex", alignItems:"center", justifyContent:"center", fontSize:20, border:"2px solid rgba(255,255,255,0.3)" },
+  logoText:     { fontSize:18, fontWeight:800, color:"#fff", letterSpacing:"0.5px" },
+  logoSub:      { fontSize:10, color:"rgba(255,255,255,0.7)", marginTop:2 },
+  nav:          { display:"flex", gap:6 },
+  navBtn:       { background:"rgba(255,255,255,0.1)", border:"1px solid rgba(255,255,255,0.2)", color:"rgba(255,255,255,0.85)", borderRadius:8, padding:"8px 16px", cursor:"pointer", fontSize:12, fontFamily:"inherit", fontWeight:600 },
+  navBtnActive: { background:"rgba(255,255,255,0.25)", border:"1px solid rgba(255,255,255,0.5)", color:"#fff" },
+  toast:        { position:"fixed", top:16, left:"50%", transform:"translateX(-50%)", padding:"11px 28px", borderRadius:25, color:"#fff", fontWeight:700, fontSize:13, zIndex:999, boxShadow:"0 4px 20px rgba(0,0,0,0.2)" },
+  main:         { maxWidth:1200, margin:"0 auto", padding:"24px 16px 80px" },
+  kpiRow:       { display:"grid", gridTemplateColumns:"repeat(4,1fr)", gap:12, marginBottom:20 },
+  kpiCard:      { background:"#fff", borderRadius:12, padding:"16px 18px", boxShadow:"0 2px 8px rgba(29,78,216,0.08)" },
+  kpiNum:       { fontSize:32, fontWeight:800, lineHeight:1 },
+  kpiLabel:     { fontSize:11, color:"#64748b", marginTop:4, fontWeight:600 },
+  kpiIcon:      { width:38, height:38, borderRadius:10, display:"flex", alignItems:"center", justifyContent:"center", fontSize:18 },
+  kpiBar:       { height:5, background:"#f1f5f9", borderRadius:3, overflow:"hidden" },
+  kpiBarFill:   { height:"100%", borderRadius:3, transition:"width 0.5s" },
+  sectionCard:  { background:"#fff", borderRadius:14, padding:"20px 20px 16px", boxShadow:"0 2px 12px rgba(29,78,216,0.08)", marginBottom:16 },
+  sectionCardHeader: { display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:16, flexWrap:"wrap", gap:8 },
+  sectionTitle: { fontSize:15, fontWeight:700, color:"#1e3a5f" },
+  pageLabel:    { fontSize:11, color:"#64748b", marginRight:4 },
+  pageBtn:      { background:"#f0f9ff", border:"1px solid #bae6fd", color:"#0369a1", borderRadius:6, padding:"5px 10px", cursor:"pointer", fontSize:11, fontFamily:"inherit", fontWeight:600 },
+  pageBtnActive:{ background:"#1d4ed8", border:"1px solid #1d4ed8", color:"#fff" },
+  gridHeader:   { display:"flex", alignItems:"center", gap:4, marginBottom:6, paddingBottom:8, borderBottom:"2px solid #e0f2fe" },
+  nivelHeader:  { flex:1, minWidth:80, display:"flex", justifyContent:"center" },
+  nivelHeaderBadge: { background:"#1d4ed8", color:"#fff", borderRadius:6, padding:"4px 12px", fontSize:11, fontWeight:700 },
+  filaLabel:    { width:48, flexShrink:0, display:"flex", alignItems:"center", justifyContent:"center" },
+  filaNum:      { background:"#e0f2fe", color:"#0369a1", borderRadius:6, padding:"3px 8px", fontSize:11, fontWeight:700 },
+  gridFila:     { display:"flex", alignItems:"center", gap:4, marginBottom:3, borderRadius:8, padding:"4px 0" },
+  slot:         { flex:1, minWidth:80, height:54, borderRadius:8, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", padding:"4px 3px", cursor:"pointer", fontFamily:"inherit", transition:"transform 0.1s, box-shadow 0.1s" },
+  slotCode:     { fontSize:11, fontWeight:800, lineHeight:1.2 },
+  slotName:     { fontSize:8, marginTop:1, textAlign:"center", opacity:0.8 },
+  slotFree:     { fontSize:18, opacity:0.4, fontWeight:300 },
+  leyenda:      { display:"flex", gap:16, marginTop:14, flexWrap:"wrap", alignItems:"center", paddingTop:12, borderTop:"1px solid #e0f2fe" },
+  leyendaItem:  { display:"flex", alignItems:"center", gap:6, fontSize:11 },
+  searchInput:  { width:"100%", background:"#f8fafc", border:"1.5px solid #cbd5e1", borderRadius:10, padding:"10px 16px", color:"#1e293b", fontSize:13, fontFamily:"inherit", marginBottom:14 },
+  lista:        { display:"flex", flexDirection:"column", gap:8 },
+  listaItem:    { background:"#f8fafc", border:"1.5px solid #e2e8f0", borderRadius:10, padding:"12px 16px", display:"flex", alignItems:"center", gap:12, cursor:"pointer" },
+  listaPosBox:  { background:"#1d4ed8", borderRadius:8, padding:"6px 10px", textAlign:"center", flexShrink:0 },
+  listaPosF:    { fontSize:12, fontWeight:800, color:"#fff", lineHeight:1.2 },
+  listaPosN:    { fontSize:10, color:"rgba(255,255,255,0.75)" },
+  listaInfo:    { flex:1 },
+  listaNombre:  { fontSize:14, fontWeight:600, color:"#1e293b" },
+  listaMeta:    { fontSize:11, color:"#64748b", marginTop:3 },
+  arrow:        { color:"#94a3b8", fontSize:18 },
+  emptyMsg:     { textAlign:"center", color:"#94a3b8", padding:"32px", fontSize:14 },
+  analGrid:     { display:"grid", gridTemplateColumns:"1fr 1fr", gap:14 },
+  analCard:     { background:"#fff", border:"1px solid #e0f2fe", borderRadius:12, padding:20, boxShadow:"0 1px 4px rgba(29,78,216,0.06)" },
+  analTitle:    { fontSize:11, fontWeight:800, color:"#64748b", marginBottom:16, letterSpacing:"0.8px", textTransform:"uppercase" },
+  analStatRow:  { display:"flex", alignItems:"baseline", marginBottom:4 },
+  analBar:      { height:7, background:"#f1f5f9", borderRadius:4, overflow:"hidden", marginTop:4 },
+  analBarFill:  { height:"100%", borderRadius:4, transition:"width 0.5s" },
+  analRow:      { display:"flex", alignItems:"center" },
+  modalOverlay: { position:"fixed", inset:0, background:"rgba(15,23,42,0.6)", zIndex:200, display:"flex", alignItems:"center", justifyContent:"center", padding:16, backdropFilter:"blur(4px)" },
+  modalBox:     { background:"#fff", border:"1px solid #e0f2fe", borderRadius:16, width:"100%", maxWidth:500, maxHeight:"92vh", overflow:"auto", boxShadow:"0 20px 60px rgba(29,78,216,0.2)" },
+  modalHeader:  { display:"flex", justifyContent:"space-between", alignItems:"flex-start", padding:"20px 22px 0", marginBottom:14 },
+  modalTitle:   { fontSize:20, fontWeight:800, color:"#1e3a5f" },
+  modalSub:     { fontSize:12, color:"#64748b", marginTop:3 },
+  modalBody:    { padding:"0 22px" },
+  modalFooter:  { display:"flex", alignItems:"center", padding:"14px 22px", borderTop:"1px solid #e0f2fe", marginTop:14, background:"#f8fafc", borderRadius:"0 0 16px 16px" },
+  voiceBanner:  { display:"flex", alignItems:"center", gap:10, margin:"0 22px 12px", padding:"10px 14px", background:"#fef3c7", border:"1.5px solid #fcd34d", borderRadius:8, fontSize:13, color:"#92400e" },
+  voiceDot:     { width:10, height:10, borderRadius:"50%", background:"#dc2626", flexShrink:0, animation:"pulse 0.8s infinite" },
+  voiceLog:     { margin:"0 22px 10px", padding:"8px 12px", background:"#f0fdf4", border:"1.5px solid #86efac", borderRadius:7, fontSize:12, color:"#166534" },
+  inputRow:     { display:"flex", gap:8, alignItems:"center" },
+  formGroup:    { marginBottom:14 },
+  formLabel:    { display:"block", fontSize:12, color:"#374151", marginBottom:6, fontWeight:600 },
+  formInput:    { background:"#f8fafc", border:"1.5px solid #cbd5e1", borderRadius:8, padding:"10px 12px", color:"#1e293b", fontSize:13, fontFamily:"inherit", width:"100%", transition:"border-color 0.2s, box-shadow 0.2s" },
+  fieldError:   { fontSize:11, color:"#dc2626", marginTop:4, fontWeight:600 },
+  micBtn:       { width:40, height:40, borderRadius:8, cursor:"pointer", fontSize:16, display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0, border:"none" },
+  voiceTips:    { background:"#f0f9ff", border:"1px solid #bae6fd", borderRadius:8, padding:"12px 14px", marginTop:4 },
+  voiceTipsTitle:{ fontSize:11, color:"#0369a1", marginBottom:8, fontWeight:700 },
+  voiceTipRow:  { display:"flex", gap:10, marginBottom:5, alignItems:"baseline" },
+  voiceTipField:{ fontSize:10, color:"#1d4ed8", width:76, flexShrink:0, fontWeight:700 },
+  voiceTipEx:   { fontSize:10, color:"#64748b" },
+  btnClose:     { background:"#f1f5f9", border:"1px solid #e2e8f0", color:"#64748b", borderRadius:6, width:30, height:30, cursor:"pointer", fontSize:14, display:"flex", alignItems:"center", justifyContent:"center" },
+  btnQrSm:      { background:"#eff6ff", border:"1px solid #93c5fd", color:"#1d4ed8", borderRadius:6, padding:"5px 14px", cursor:"pointer", fontSize:12, fontFamily:"inherit", fontWeight:600 },
+  btnDel:       { background:"#fff", border:"1.5px solid #fca5a5", color:"#dc2626", borderRadius:8, padding:"9px 14px", cursor:"pointer", fontSize:12, fontFamily:"inherit", fontWeight:600 },
+  btnCancel:    { background:"#f1f5f9", border:"1px solid #e2e8f0", color:"#64748b", borderRadius:8, padding:"9px 16px", cursor:"pointer", fontSize:13, fontFamily:"inherit", fontWeight:600 },
+  btnSave:      { background:"linear-gradient(135deg,#1d4ed8,#3b82f6)", border:"none", color:"#fff", borderRadius:8, padding:"9px 22px", cursor:"pointer", fontSize:13, fontWeight:700, fontFamily:"inherit", boxShadow:"0 2px 8px rgba(29,78,216,0.3)" },
+  footer:       { background:"#1e3a5f", color:"rgba(255,255,255,0.5)", padding:"12px 20px", display:"flex", justifyContent:"space-between", fontSize:10, flexWrap:"wrap", gap:6 },
+};
